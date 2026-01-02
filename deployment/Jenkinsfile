@@ -1,0 +1,272 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'DEPLOY_ENV', choices: ['local', 'staging', 'production'], description: 'Select deployment environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip tests (use with caution)')
+        booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'Force deployment even if tests fail')
+    }
+
+    environment {
+        DOCKER_USER          = 'hussainsaddam'
+        REGISTRY_CREDENTIALS = 'docker-hub-credentials'
+        BUILD_VERSION        = "${env.BUILD_NUMBER}"
+        PREVIOUS_BUILD       = "${env.BUILD_NUMBER.toInteger() - 1}"
+    }
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "📦 Checking out code..."
+                checkout([$class: 'GitSCM',
+                    branches: [[name: '*/jenkindev']],
+                    extensions: [[$class: 'WipeWorkspace']],
+                    userRemoteConfigs: [[url: 'https://github.com/SaddamHosyn/buy-01project.git']]
+                ])
+            }
+        }
+
+        stage('Backend Tests') {
+    when {
+        expression { params.SKIP_TESTS == false }
+    }
+    steps {
+        echo '🧪 Running backend tests...'
+        script {
+            dir('user-service') {
+                sh 'mvn clean test -Dmaven.test.failure.ignore=false'
+            }
+            dir('product-service') {
+                sh 'mvn clean test -Dmaven.test.failure.ignore=false'
+            }
+            dir('media-service') {
+                sh 'mvn clean test -Dmaven.test.failure.ignore=false'
+            }
+        }
+    }
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: '**/target/surefire-reports/*.xml'
+        }
+        failure {
+            echo '❌ Backend tests failed!'
+        }
+        success {
+            echo '✅ Backend tests passed!'
+        }
+    }
+}
+
+        stage('Frontend Tests') {
+    when {
+        expression { params.SKIP_TESTS == false }
+    }
+    steps {
+        echo '🧪 Running frontend tests (Karma/Jasmine)...'
+        dir('buy-01-ui') {
+            sh '''
+                export CHROME_BIN=/usr/bin/chromium
+                rm -rf node_modules package-lock.json
+                npm install --legacy-peer-deps
+                npx ng test --watch=false --browsers=ChromeHeadlessCI --code-coverage
+            '''
+        }
+    }
+    post {
+        failure {
+            echo '❌ Frontend tests failed!'
+        }
+        success {
+            echo '✅ Frontend tests passed!'
+        }
+    }
+}
+
+        stage('Build Backend JARs') {
+            steps {
+                echo '📦 Building backend JAR files...'
+                script {
+                    def services = ['service-registry', 'user-service', 'product-service', 'media-service']
+                    for (service in services) {
+                        dir(service) {
+                            sh 'mvn clean package -DskipTests'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                echo "🐳 Building Docker Images in parallel with tag: ${BUILD_VERSION}..."
+                script {
+                    parallel(
+                        'service-registry': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-service-registry:latest -t ${DOCKER_USER}/buy-01-service-registry:${BUILD_VERSION} ./service-registry"
+                        },
+                        'api-gateway': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-api-gateway:latest -t ${DOCKER_USER}/buy-01-api-gateway:${BUILD_VERSION} ./api-gateway"
+                        },
+                        'user-service': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-user-service:latest -t ${DOCKER_USER}/buy-01-user-service:${BUILD_VERSION} ./user-service"
+                        },
+                        'product-service': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-product-service:latest -t ${DOCKER_USER}/buy-01-product-service:${BUILD_VERSION} ./product-service"
+                        },
+                        'media-service': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-media-service:latest -t ${DOCKER_USER}/buy-01-media-service:${BUILD_VERSION} ./media-service"
+                        },
+                        'frontend': {
+                            sh "docker build -t ${DOCKER_USER}/buy-01-frontend:latest -t ${DOCKER_USER}/buy-01-frontend:${BUILD_VERSION} ./buy-01-ui"
+                        }
+                    )
+                }
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                echo "🚀 Pushing images to Docker Hub in parallel..."
+                withCredentials([usernamePassword(
+                    credentialsId: REGISTRY_CREDENTIALS,
+                    usernameVariable: 'DOCKER_USER_CRED',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER_CRED --password-stdin'
+                    script {
+                        parallel(
+                            'service-registry': {
+                                sh "docker push ${DOCKER_USER}/buy-01-service-registry:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-service-registry:${BUILD_VERSION}"
+                            },
+                            'api-gateway': {
+                                sh "docker push ${DOCKER_USER}/buy-01-api-gateway:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-api-gateway:${BUILD_VERSION}"
+                            },
+                            'user-service': {
+                                sh "docker push ${DOCKER_USER}/buy-01-user-service:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-user-service:${BUILD_VERSION}"
+                            },
+                            'product-service': {
+                                sh "docker push ${DOCKER_USER}/buy-01-product-service:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-product-service:${BUILD_VERSION}"
+                            },
+                            'media-service': {
+                                sh "docker push ${DOCKER_USER}/buy-01-media-service:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-media-service:${BUILD_VERSION}"
+                            },
+                            'frontend': {
+                                sh "docker push ${DOCKER_USER}/buy-01-frontend:latest"
+                                sh "docker push ${DOCKER_USER}/buy-01-frontend:${BUILD_VERSION}"
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo "🚀 Deploying to ${params.DEPLOY_ENV} environment..."
+                sh '''
+                    cd deployment
+                    
+                    docker stop buy-01-zookeeper buy-01-mongodb buy-01-kafka buy-01-service-registry buy-01-api-gateway buy-01-user-service buy-01-product-service buy-01-media-service buy-01-frontend 2>/dev/null || true
+                    docker rm buy-01-zookeeper buy-01-mongodb buy-01-kafka buy-01-service-registry buy-01-api-gateway buy-01-user-service buy-01-product-service buy-01-media-service buy-01-frontend 2>/dev/null || true
+                    
+                    docker-compose pull
+                    docker-compose up -d --remove-orphans
+                    
+                    echo "⏳ Waiting for services to start..."
+                    sleep 45
+                    
+                    echo "🔍 Running health checks..."
+                    HEALTHY=true
+                    
+                    if ! docker ps | grep -q "buy-01-service-registry"; then
+                        echo "❌ service-registry is not running"
+                        HEALTHY=false
+                    fi
+                    
+                    if ! docker ps | grep -q "buy-01-api-gateway"; then
+                        echo "❌ api-gateway is not running"
+                        HEALTHY=false
+                    fi
+                    
+                    if [ "$HEALTHY" = "false" ]; then
+                        echo "❌ Deployment health check failed!"
+                        exit 1
+                    fi
+                    
+                    echo "✅ All services are running!"
+                '''
+            }
+        }
+
+        stage('Rollback on Failure') {
+            when {
+                expression { currentBuild.result == 'FAILURE' || currentBuild.result == 'UNSTABLE' }
+            }
+            steps {
+                echo "🔄 Rolling back to previous version: ${PREVIOUS_BUILD}..."
+                sh '''
+                    cd deployment
+                    
+                    docker-compose down || true
+                    
+                    docker pull hussainsaddam/buy-01-service-registry:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    docker pull hussainsaddam/buy-01-api-gateway:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    docker pull hussainsaddam/buy-01-user-service:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    docker pull hussainsaddam/buy-01-product-service:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    docker pull hussainsaddam/buy-01-media-service:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    docker pull hussainsaddam/buy-01-frontend:${PREVIOUS_BUILD} || echo "Previous build not found"
+                    
+                    docker tag hussainsaddam/buy-01-service-registry:${PREVIOUS_BUILD} hussainsaddam/buy-01-service-registry:latest || true
+                    docker tag hussainsaddam/buy-01-api-gateway:${PREVIOUS_BUILD} hussainsaddam/buy-01-api-gateway:latest || true
+                    docker tag hussainsaddam/buy-01-user-service:${PREVIOUS_BUILD} hussainsaddam/buy-01-user-service:latest || true
+                    docker tag hussainsaddam/buy-01-product-service:${PREVIOUS_BUILD} hussainsaddam/buy-01-product-service:latest || true
+                    docker tag hussainsaddam/buy-01-media-service:${PREVIOUS_BUILD} hussainsaddam/buy-01-media-service:latest || true
+                    docker tag hussainsaddam/buy-01-frontend:${PREVIOUS_BUILD} hussainsaddam/buy-01-frontend:latest || true
+                    
+                    docker-compose up -d --remove-orphans
+                    
+                    echo "✅ Rollback completed to build ${PREVIOUS_BUILD}"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline completed successfully!"
+            echo "Build #${env.BUILD_NUMBER} - All stages passed"
+            withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+                sh '''
+                    curl -X POST -H 'Content-type: application/json' \
+                    --data "{\\"text\\":\\"✅ *SUCCESS*: Job ${JOB_NAME} Build #${BUILD_NUMBER}\\\\n${BUILD_URL}\\"}" \
+                    ${SLACK_URL}
+                '''
+            }
+        }
+        failure {
+            echo "❌ Pipeline failed!"
+            echo "Build #${env.BUILD_NUMBER} - Check logs for details"
+            withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+                sh '''
+                    curl -X POST -H 'Content-type: application/json' \
+                    --data "{\\"text\\":\\"❌ *FAILED*: Job ${JOB_NAME} Build #${BUILD_NUMBER}\\\\n${BUILD_URL}console\\"}" \
+                    ${SLACK_URL}
+                '''
+            }
+        }
+        always {
+            echo "🧹 Cleaning up workspace..."
+            cleanWs()
+        }
+    }
+}
